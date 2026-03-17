@@ -190,6 +190,7 @@ int main(void)
 //    if (dac_val > 4095) dac_val = 0;
 //    DAC1->DHR12R2 = dac_val++;
 
+// more update on tgis branch
     HAL_Delay(10);
     }
   /* USER CODE END 3 */
