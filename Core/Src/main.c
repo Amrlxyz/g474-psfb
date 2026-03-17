@@ -188,6 +188,7 @@ int main(void)
 //    if (dac_val > 4095) dac_val = 0;
 //    DAC1->DHR12R2 = dac_val++;
 
+    // New commit test comment
     HAL_Delay(1);
     }
   /* USER CODE END 3 */
