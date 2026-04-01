@@ -40,7 +40,8 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define ADC_BUFFER_SIZE 5
-#define VOUT_SCALE 15.117647059
+#define VPFC_SCALE 241.0   // (3/(3+720))^-1
+#define VOUT_SCALE 307.383 // (2.35/(2.35+720))^-1
 
 /* USER CODE END PD */
 
@@ -71,12 +72,19 @@ volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
 
-float PFCCurrent;
-float PFCVoltage;
-float OutputVoltage;
-float OutputCurrent;
-float OutputPower;
-float BatteryVoltage;
+volatile uint8_t psfb_enable = 0;
+volatile uint8_t relay_enable = 0;
+
+typedef struct {
+    float PFCCurrent;
+    float PFCVoltage;
+    float OutputVoltage;
+    float OutputCurrent;
+    float OutputPower;
+    float BatteryVoltage;
+} Sensors;
+
+Sensors sensors;
 
 float CC_Threshold;
 float CV_Threshold;
@@ -157,11 +165,11 @@ int main(void)
     if (enable_update){
         uint8_t buff[128];
         uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f\n",
-                                    PFCVoltage,
-                                    OutputVoltage,
-                                    OutputCurrent,
-                                    BatteryVoltage,
-                                    OutputPower);
+                                    sensors.PFCVoltage,
+                                    sensors.OutputVoltage,
+                                    sensors.OutputCurrent,
+                                    sensors.BatteryVoltage,
+                                    sensors.OutputPower);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
@@ -174,9 +182,13 @@ int main(void)
     DAC1->DHR12R1 = CC_ThresholdRaw;
     // (CC_Threshold * 3.3/4095 - 2.5)  / -0.1;
 
+
     uint16_t CV_ThresholdRaw = (CV_Threshold * 1.5) / VOUT_SCALE / (3.3/4095);
     DAC1->DHR12R2 = CV_ThresholdRaw;
     // CV_Threshold * 3.3/4095 * 15.12 /  1.5;
+
+    HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, psfb_enable);
+    HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
 
 //    TIM8->CCR1 = (duty*1700)/2;
 //    HAL_TIMEx_ConfigDeadTime(&htim8, deadtime);
@@ -264,14 +276,13 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 //    adcVal = HAL_ADC_GetValue(&hadc1); // Read & Update The ADC Result
 
-    PFCVoltage      = lowpass( adc_buffer[0] * 3.3/4095 * 10.6  /  1.5, PFCVoltage, 0.2);       // (75/(75+720))^-1
-    OutputVoltage   = lowpass( adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5, OutputVoltage, 0.2);    // (51/(51+720))^-1
-    OutputCurrent   = lowpass((adc_buffer[2] * 3.3/4095 - 2.5)  / -0.1, OutputCurrent, 0.01);   // 100mV / A
-    BatteryVoltage  = lowpass( adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5, BatteryVoltage, 0.2);   // (51/(51+720))^-1
-    PFCCurrent      =          adc_buffer[4];
+    sensors.PFCVoltage      = lowpass( adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5, sensors.PFCVoltage, 0.2);
+    sensors.OutputVoltage   = lowpass( adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.OutputVoltage, 0.2);
+    sensors.OutputCurrent   = lowpass((adc_buffer[2] * 3.3/4095 - 2.5)  / -0.1,      sensors.OutputCurrent, 0.05);  // 100mV / A
+    sensors.BatteryVoltage  = lowpass( adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.BatteryVoltage, 0.2);
+    sensors.PFCCurrent      =          adc_buffer[4];
 
-    OutputPower = OutputVoltage * OutputCurrent;
-
+    sensors.OutputPower = sensors.OutputVoltage * sensors.OutputCurrent;
 }
 
 
