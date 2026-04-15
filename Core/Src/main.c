@@ -42,6 +42,7 @@
 #define ADC_BUFFER_SIZE 5
 #define VPFC_SCALE 241.0   // (3/(3+720))^-1
 #define VOUT_SCALE 307.383 // (2.35/(2.35+720))^-1
+#define IOUT_OFFSET 0.98
 
 /* USER CODE END PD */
 
@@ -72,22 +73,40 @@ volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
 
-volatile uint8_t psfb_enable = 0;
+volatile uint8_t psfb_enable = 1;
 volatile uint8_t relay_enable = 0;
 
+float CC_Threshold = 2;
+float CV_Threshold = 40;
+
+float pfc_voltage_nominal = 40;
+float pfc_voltage_tolerance = 0.1;
+
+
 typedef struct {
-    float PFCCurrent;
-    float PFCVoltage;
-    float OutputVoltage;
-    float OutputCurrent;
-    float OutputPower;
-    float BatteryVoltage;
+    union {
+        float val;
+        float y0;   // Current value
+    };
+    float y1;
+    float y2;
+    float x0;   // Current measurement
+    float x1;
+    float x2;
+} Measurements;
+
+
+typedef struct {
+    Measurements PFCCurrent;
+    Measurements PFCVoltage;
+    Measurements OutputVoltage;
+    Measurements OutputCurrent;
+    Measurements OutputPower;
+    Measurements BatteryVoltage;
 } Sensors;
 
-Sensors sensors;
+Sensors sensors = {0};
 
-float CC_Threshold;
-float CV_Threshold;
 
 /* USER CODE END 0 */
 
@@ -157,37 +176,44 @@ int main(void)
 
   /* Infinite loop */
   /* USER CODE BEGIN WHILE */
-    while (1) {
+  while (1) {
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-
     if (enable_update){
         uint8_t buff[128];
         uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f\n",
-                                    sensors.PFCVoltage,
-                                    sensors.OutputVoltage,
-                                    sensors.OutputCurrent,
-                                    sensors.BatteryVoltage,
-                                    sensors.OutputPower);
+                                    sensors.PFCVoltage.val,
+                                    sensors.OutputVoltage.val,
+                                    sensors.OutputCurrent.val,
+                                    sensors.BatteryVoltage.val,
+                                    sensors.OutputPower.val);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
 //        enable_update = 0;
-        HAL_Delay(1000);
+        HAL_Delay(100);
     }
 
-
-    uint16_t CC_ThresholdRaw = (CC_Threshold * -0.1 + 2.5) / (3.3/4095);
+    uint16_t CC_ThresholdRaw = ((CC_Threshold - IOUT_OFFSET) * 0.4 + 0.5) / (3.3/4095);
     DAC1->DHR12R1 = CC_ThresholdRaw;
     // (CC_Threshold * 3.3/4095 - 2.5)  / -0.1;
-
 
     uint16_t CV_ThresholdRaw = (CV_Threshold * 1.5) / VOUT_SCALE / (3.3/4095);
     DAC1->DHR12R2 = CV_ThresholdRaw;
     // CV_Threshold * 3.3/4095 * 15.12 /  1.5;
 
-    HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, psfb_enable);
+
+    if (sensors.PFCVoltage.val < pfc_voltage_nominal * (1+pfc_voltage_tolerance) &&
+        sensors.PFCVoltage.val > pfc_voltage_nominal * (1-pfc_voltage_tolerance) &&
+        psfb_enable){
+
+        HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, 1);
+    } else {
+        HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, 0);
+    }
+
+
     HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
 
 //    TIM8->CCR1 = (duty*1700)/2;
@@ -198,13 +224,11 @@ int main(void)
 
 //        enable_update = 0;
 
-
 //    if (dac_val > 4095) dac_val = 0;
 //    DAC1->DHR12R2 = dac_val++;
 
-    // New commit test comment
     HAL_Delay(1);
-    }
+  }
   /* USER CODE END 3 */
 }
 
@@ -266,9 +290,29 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
     }
 }
 
+void lowpass(Measurements *meas, float x0){
 
-float lowpass(float newValue, float oldValue, float a){
-    return newValue * a + oldValue * (1-a);
+    // https://www.earlevel.com/main/2021/09/02/biquad-calculator-v3/
+    // 1kHz 10Hz cutoff
+    static const float b0 = 0.00094469146f;
+    static const float b1 = 0.00188938292f;
+    static const float b2 = 0.00094469146f;
+    static const float a1 = -1.9111962882f;
+    static const float a2 = 0.9149750541f;
+
+    // Shift Values
+    meas->x2 = meas->x1;
+    meas->x1 = meas->x0;
+    meas->y2 = meas->y1;
+    meas->y1 = meas->y0;
+
+    meas->x0 = x0;          // Save current measurement
+
+    meas->y0 = meas->x0 * b0 +
+               meas->x1 * b1 +
+               meas->x2 * b2 -
+               meas->y1 * a1 -
+               meas->y2 * a2;
 }
 
 
@@ -276,13 +320,14 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 //    adcVal = HAL_ADC_GetValue(&hadc1); // Read & Update The ADC Result
 
-    sensors.PFCVoltage      = lowpass( adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5, sensors.PFCVoltage, 0.2);
-    sensors.OutputVoltage   = lowpass( adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.OutputVoltage, 0.2);
-    sensors.OutputCurrent   = lowpass((adc_buffer[2] * 3.3/4095 - 2.5)  / -0.1,      sensors.OutputCurrent, 0.05);  // 100mV / A
-    sensors.BatteryVoltage  = lowpass( adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.BatteryVoltage, 0.2);
-    sensors.PFCCurrent      =          adc_buffer[4];
+    lowpass(&sensors.PFCVoltage,      adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5);
+    lowpass(&sensors.OutputVoltage,   adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5);
+    lowpass(&sensors.OutputCurrent,  (adc_buffer[2] * 3.3/4095 - 0.5) / 0.4 + IOUT_OFFSET);
+    lowpass(&sensors.BatteryVoltage,  adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5);
+    lowpass(&sensors.PFCCurrent,      adc_buffer[4]);
 
-    sensors.OutputPower = sensors.OutputVoltage * sensors.OutputCurrent;
+    lowpass(&sensors.OutputPower,     sensors.OutputVoltage.val * sensors.OutputCurrent.val);
+
 }
 
 
