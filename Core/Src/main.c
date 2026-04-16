@@ -40,6 +40,7 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define ADC_BUFFER_SIZE 5
+#define ADC2_BUFFER_SIZE 3
 #define VPFC_SCALE 241.0   // (3/(3+720))^-1
 #define VOUT_SCALE 307.383 // (2.35/(2.35+720))^-1
 
@@ -71,6 +72,7 @@ volatile uint32_t deadtime = 17;
 volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
+volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE]
 
 volatile uint8_t psfb_enable = 0;
 volatile uint8_t relay_enable = 0;
@@ -85,6 +87,14 @@ typedef struct {
 } Sensors;
 
 Sensors sensors;
+
+typedef struct{
+  float temp1; 
+  float temp2; 
+  float temp3;
+} ntc;
+
+ntc tempSensor; 
 
 float CC_Threshold;
 float CV_Threshold;
@@ -144,7 +154,8 @@ int main(void)
 
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE);
-
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)adc2_buffer, ADC2_BUFFER_SIZE);
 
   DAC_ChannelConfTypeDef sConfig;
   HAL_DACEx_SelfCalibrate(&hdac1, &sConfig, DAC_CHANNEL_1);
@@ -164,12 +175,13 @@ int main(void)
 
     if (enable_update){
         uint8_t buff[128];
-        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f\n",
+        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f\n",
                                     sensors.PFCVoltage,
                                     sensors.OutputVoltage,
                                     sensors.OutputCurrent,
                                     sensors.BatteryVoltage,
-                                    sensors.OutputPower);
+                                    sensors.OutputPower,
+                                    tempSensor.temp1);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
@@ -283,6 +295,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
     sensors.PFCCurrent      =          adc_buffer[4];
 
     sensors.OutputPower = sensors.OutputVoltage * sensors.OutputCurrent;
+    tempSensor.temp1        = adc2_buffer[0];
 }
 
 
