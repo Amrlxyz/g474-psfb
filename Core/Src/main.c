@@ -29,6 +29,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "math.h"
 
 /* USER CODE END Includes */
 
@@ -43,6 +44,11 @@
 #define ADC2_BUFFER_SIZE 3
 #define VPFC_SCALE 241.0   // (3/(3+720))^-1
 #define VOUT_SCALE 307.383 // (2.35/(2.35+720))^-1
+#define R_FIXED_TEMP 10000
+#define A1 0.003354016434680530000f
+#define B1 0.000256523550896126f
+#define C1 2.60597012072052E-06f
+#define D1 6.3292612648746E-08f
 
 /* USER CODE END PD */
 
@@ -139,9 +145,11 @@ int main(void)
   MX_TIM1_Init();
   MX_TIM6_Init();
   MX_TIM8_Init();
+  MX_TIM3_Init();
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_Base_Start_IT(&htim3);
 
   HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
   HAL_TIMEx_PWMN_Start(&htim8, TIM_CHANNEL_1);
@@ -175,13 +183,15 @@ int main(void)
 
     if (enable_update){
         uint8_t buff[128];
-        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f\n",
+        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f, Temp2:%7.2f, Temp3:%7.2f\n",
                                     sensors.PFCVoltage,
                                     sensors.OutputVoltage,
                                     sensors.OutputCurrent,
                                     sensors.BatteryVoltage,
                                     sensors.OutputPower,
-                                    tempSensor.temp1);
+                                    tempSensor.temp1, 
+                                    tempSensor.temp2,
+                                    tempSensor.temp3);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
@@ -287,17 +297,40 @@ float lowpass(float newValue, float oldValue, float a){
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 //    adcVal = HAL_ADC_GetValue(&hadc1); // Read & Update The ADC Result
+    if (hadc->Instance == ADC1)
+    {
+        sensors.PFCVoltage      = lowpass( adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5, sensors.PFCVoltage, 0.2);
+        sensors.OutputVoltage   = lowpass( adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.OutputVoltage, 0.2);
+        sensors.OutputCurrent   = lowpass((adc_buffer[2] * 3.3/4095 - 2.5)  / -0.1,      sensors.OutputCurrent, 0.05);  // 100mV / A
+        sensors.BatteryVoltage  = lowpass( adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.BatteryVoltage, 0.2);
+        sensors.PFCCurrent      =          adc_buffer[4];
 
-    sensors.PFCVoltage      = lowpass( adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5, sensors.PFCVoltage, 0.2);
-    sensors.OutputVoltage   = lowpass( adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.OutputVoltage, 0.2);
-    sensors.OutputCurrent   = lowpass((adc_buffer[2] * 3.3/4095 - 2.5)  / -0.1,      sensors.OutputCurrent, 0.05);  // 100mV / A
-    sensors.BatteryVoltage  = lowpass( adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5, sensors.BatteryVoltage, 0.2);
-    sensors.PFCCurrent      =          adc_buffer[4];
+        sensors.OutputPower = sensors.OutputVoltage * sensors.OutputCurrent;
+    }
+    
+    else if (hadc->Instance == ADC2)
+    {
+        float Rntc1 =  (R_FIXED_TEMP * adc2_buffer[0])/(4095 - adc2_buffer[0]); //lesser variables
+        float Rntc2 =  (R_FIXED_TEMP * adc2_buffer[1])/(4095 - adc2_buffer[1]); 
+        float Rntc3 =  (R_FIXED_TEMP * adc2_buffer[2])/(4095 - adc2_buffer[2]); 
 
-    sensors.OutputPower = sensors.OutputVoltage * sensors.OutputCurrent;
-    tempSensor.temp1        = adc2_buffer[0];
+        float lnR1 = log(Rntc1/10000);
+        float lnR2 = log(Rntc2/10000);
+        float lnR3 = log(Rntc3/10000); 
+        tempSensor.temp1 = 1/(A1 + B1 * lnR1 + C1 * lnR1 * lnR1 + D1 * lnR1 * lnR1 * lnR1) - 273.15; //Steinhart-Hart equation from Vishay
+        tempSensor.temp2 = 1/(A1 + B1 * lnR2 + C1 * lnR2 * lnR2 + D1 * lnR2 * lnR2 * lnR2) - 273.15;
+        tempSensor.temp3 = 1/(A1 + B1 * lnR3 + C1 * lnR3 * lnR3 + D1 * lnR3 * lnR3 * lnR3) - 273.15;
+
+    /**float Vtemp1 = adc2_buffer[0] * 3.3/4095; 
+    float Vtemp2 = adc2_buffer[1] * 3.3/4095;
+    float Vtemp3 = adc2_buffer[2] * 3.3/4095;
+
+    float Rntc1 =  (R_FIXED_TEMP * Vtemp1)/(3.3 - Vtemp1);
+    float Rntc2 =  (R_FIXED_TEMP * Vtemp2)/(3.3 - Vtemp2);
+    float Rntc3 =  (R_FIXED_TEMP * Vtemp3)/(3.3 - Vtemp3); **/
+    }
+
 }
-
 
 
 /* USER CODE END 4 */
