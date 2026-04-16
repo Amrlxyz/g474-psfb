@@ -29,6 +29,7 @@
 /* Private includes ----------------------------------------------------------*/
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
+#include "math.h"
 
 /* USER CODE END Includes */
 
@@ -40,8 +41,14 @@
 /* Private define ------------------------------------------------------------*/
 /* USER CODE BEGIN PD */
 #define ADC_BUFFER_SIZE 5
+#define ADC2_BUFFER_SIZE 3
 #define VPFC_SCALE 241.0   // (3/(3+720))^-1
 #define VOUT_SCALE 307.383 // (2.35/(2.35+720))^-1
+#define R_FIXED_TEMP 10000
+#define A1 0.003354016434680530000f
+#define B1 0.000256523550896126f
+#define C1 2.60597012072052E-06f
+#define D1 6.3292612648746E-08f
 #define IOUT_OFFSET 0.98
 
 /* USER CODE END PD */
@@ -72,6 +79,7 @@ volatile uint32_t deadtime = 17;
 volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
+volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE]
 
 volatile uint8_t psfb_enable = 1;
 volatile uint8_t relay_enable = 0;
@@ -106,6 +114,14 @@ typedef struct {
 } Sensors;
 
 Sensors sensors = {0};
+
+typedef struct{
+  float temp1; 
+  float temp2; 
+  float temp3;
+} ntc;
+
+ntc tempSensor; 
 
 
 /* USER CODE END 0 */
@@ -152,6 +168,7 @@ int main(void)
   /* USER CODE BEGIN 2 */
 
   HAL_TIM_Base_Start_IT(&htim6);
+  HAL_TIM_Base_Start_IT(&htim3);
 
   HAL_TIM_PWM_Start(&htim8, TIM_CHANNEL_1);
   HAL_TIMEx_PWMN_Start(&htim8, TIM_CHANNEL_1);
@@ -164,7 +181,8 @@ int main(void)
 
   HAL_ADCEx_Calibration_Start(&hadc1, ADC_SINGLE_ENDED);
   HAL_ADC_Start_DMA(&hadc1, (uint32_t *)adc_buffer, ADC_BUFFER_SIZE);
-
+  HAL_ADCEx_Calibration_Start(&hadc2, ADC_SINGLE_ENDED);
+  HAL_ADC_Start_DMA(&hadc2, (uint32_t *)adc2_buffer, ADC2_BUFFER_SIZE);
 
   DAC_ChannelConfTypeDef sConfig;
   HAL_DACEx_SelfCalibrate(&hdac1, &sConfig, DAC_CHANNEL_1);
@@ -183,12 +201,15 @@ int main(void)
     /* USER CODE BEGIN 3 */
     if (enable_update){
         uint8_t buff[128];
-        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f\n",
+        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f, Temp2:%7.2f, Temp3:%7.2f\n",
                                     sensors.PFCVoltage.val,
                                     sensors.OutputVoltage.val,
                                     sensors.OutputCurrent.val,
                                     sensors.BatteryVoltage.val,
-                                    sensors.OutputPower.val);
+                                    sensors.OutputPower.val,
+                                    tempSensor.temp1, 
+                                    tempSensor.temp2,
+                                    tempSensor.temp3);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
@@ -320,17 +341,41 @@ void lowpass(Measurements *meas, float x0){
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 //    adcVal = HAL_ADC_GetValue(&hadc1); // Read & Update The ADC Result
+    if (hadc->Instance == ADC1)
+    {
+        lowpass(&sensors.PFCVoltage,      adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5);
+        lowpass(&sensors.OutputVoltage,   adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5);
+        lowpass(&sensors.OutputCurrent,  (adc_buffer[2] * 3.3/4095 - 0.5) / 0.4 + IOUT_OFFSET);
+        lowpass(&sensors.BatteryVoltage,  adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5);
+        lowpass(&sensors.PFCCurrent,      adc_buffer[4]);
 
-    lowpass(&sensors.PFCVoltage,      adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5);
-    lowpass(&sensors.OutputVoltage,   adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5);
-    lowpass(&sensors.OutputCurrent,  (adc_buffer[2] * 3.3/4095 - 0.5) / 0.4 + IOUT_OFFSET);
-    lowpass(&sensors.BatteryVoltage,  adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5);
-    lowpass(&sensors.PFCCurrent,      adc_buffer[4]);
+        lowpass(&sensors.OutputPower,     sensors.OutputVoltage.val * sensors.OutputCurrent.val);
 
-    lowpass(&sensors.OutputPower,     sensors.OutputVoltage.val * sensors.OutputCurrent.val);
+    }
+    
+    else if (hadc->Instance == ADC2)
+    {
+        float Rntc1 =  (R_FIXED_TEMP * adc2_buffer[0])/(4095 - adc2_buffer[0]); //lesser variables
+        float Rntc2 =  (R_FIXED_TEMP * adc2_buffer[1])/(4095 - adc2_buffer[1]); 
+        float Rntc3 =  (R_FIXED_TEMP * adc2_buffer[2])/(4095 - adc2_buffer[2]); 
+
+        float lnR1 = log(Rntc1/10000);
+        float lnR2 = log(Rntc2/10000);
+        float lnR3 = log(Rntc3/10000); 
+        tempSensor.temp1 = 1/(A1 + B1 * lnR1 + C1 * lnR1 * lnR1 + D1 * lnR1 * lnR1 * lnR1) - 273.15; //Steinhart-Hart equation from Vishay
+        tempSensor.temp2 = 1/(A1 + B1 * lnR2 + C1 * lnR2 * lnR2 + D1 * lnR2 * lnR2 * lnR2) - 273.15;
+        tempSensor.temp3 = 1/(A1 + B1 * lnR3 + C1 * lnR3 * lnR3 + D1 * lnR3 * lnR3 * lnR3) - 273.15;
+
+    /**float Vtemp1 = adc2_buffer[0] * 3.3/4095; 
+    float Vtemp2 = adc2_buffer[1] * 3.3/4095;
+    float Vtemp3 = adc2_buffer[2] * 3.3/4095;
+
+    float Rntc1 =  (R_FIXED_TEMP * Vtemp1)/(3.3 - Vtemp1);
+    float Rntc2 =  (R_FIXED_TEMP * Vtemp2)/(3.3 - Vtemp2);
+    float Rntc3 =  (R_FIXED_TEMP * Vtemp3)/(3.3 - Vtemp3); **/
+    }
 
 }
-
 
 
 /* USER CODE END 4 */
