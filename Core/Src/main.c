@@ -30,6 +30,8 @@
 /* USER CODE BEGIN Includes */
 #include "stdio.h"
 #include "math.h"
+#include "stdlib.h"
+#include "string.h"
 
 /* USER CODE END Includes */
 
@@ -75,7 +77,7 @@ void SystemClock_Config(void);
 /* USER CODE BEGIN 0 */
 
 volatile float duty = 0.1;
-volatile uint32_t deadtime = 17;
+volatile uint32_t deadtime = 0;
 volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
@@ -84,8 +86,11 @@ volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE];
 volatile uint8_t psfb_enable = 0;
 volatile uint8_t relay_enable = 0;
 
-float CC_Threshold = 2;
-float CV_Threshold = 40;
+float CC_Threshold = 3;
+float CC_Threshold_Ramp = 0;
+
+float CV_Threshold = 0;
+float CV_Threshold_Ramp = 0;
 
 float pfc_voltage_nominal = 40;
 float pfc_voltage_tolerance = 0.1;
@@ -115,6 +120,10 @@ typedef struct {
 } Sensors;
 
 Sensors sensors = {0};
+
+#define UART_RX_BUFFER_SIZE 20
+uint8_t UART2_RxBuffer[UART_RX_BUFFER_SIZE] = {0};
+uint16_t RxDataLen = 0;
 
 
 
@@ -184,6 +193,8 @@ int main(void)
   HAL_DAC_Start(&hdac1, DAC1_CHANNEL_1);
   HAL_DAC_Start(&hdac1, DAC1_CHANNEL_2);
 
+  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE);
+
 //  uint16_t dac_val = 0;
   /* USER CODE END 2 */
 
@@ -207,19 +218,12 @@ int main(void)
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
-
 //        enable_update = 0;
-        HAL_Delay(100);
+
+        if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE) == HAL_ERROR){
+            Error_Handler();
+        }
     }
-
-    uint16_t CC_ThresholdRaw = ((CC_Threshold - IOUT_OFFSET) * 0.4 + 0.5) / (3.3/4095);
-    DAC1->DHR12R1 = CC_ThresholdRaw;
-    // (CC_Threshold * 3.3/4095 - 2.5)  / -0.1;
-
-    uint16_t CV_ThresholdRaw = (CV_Threshold * 1.5) / VOUT_SCALE / (3.3/4095);
-    DAC1->DHR12R2 = CV_ThresholdRaw;
-    // CV_Threshold * 3.3/4095 * 15.12 /  1.5;
-
 
 //    if (sensors.PFCVoltage.val < pfc_voltage_nominal * (1+pfc_voltage_tolerance) &&
 //        sensors.PFCVoltage.val > pfc_voltage_nominal * (1-pfc_voltage_tolerance) &&
@@ -231,13 +235,22 @@ int main(void)
         HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, 0);
     }
 
-
     HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
 
-//    TIM8->CCR1 = (duty*1700)/2;
+
+    // Variable fan speed control
+    duty = (sensors.temp[2].val - 30) / 40;
+
+    if (duty > 1)
+        duty = 1;
+    if (duty < 0)
+        duty = 0;
+
+    TIM8->CCR1 = 1700 * duty;
+    TIM1->CCR1 = 1700 * duty;
+
+
 //    HAL_TIMEx_ConfigDeadTime(&htim8, deadtime);
-//
-//    TIM1->CCR1 = (duty*1700)/2;
 //    HAL_TIMEx_ConfigDeadTime(&htim1, deadtime);
 
 //        enable_update = 0;
@@ -245,7 +258,7 @@ int main(void)
 //    if (dac_val > 4095) dac_val = 0;
 //    DAC1->DHR12R2 = dac_val++;
 
-    HAL_Delay(1);
+    HAL_Delay(100);
   }
   /* USER CODE END 3 */
 }
@@ -298,25 +311,86 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+
+
+static void rampCCCV(void)
+{
+    // Divide by 1000 for 1kHz
+    static const float rampRateCC = 0.2 / 1000.0;
+    static const float rampRateCV = 50  / 1000.0;
+
+    if (psfb_enable){
+        // CC Ramp
+        if (CC_Threshold_Ramp < CC_Threshold){
+            CC_Threshold_Ramp += rampRateCC;
+            if (CC_Threshold_Ramp > CC_Threshold){
+                CC_Threshold_Ramp = CC_Threshold;
+            }
+        } else if (CC_Threshold_Ramp > CC_Threshold){
+            CC_Threshold_Ramp -= rampRateCC;
+            if (CC_Threshold_Ramp < CC_Threshold){
+                CC_Threshold_Ramp = CC_Threshold;
+            }
+        }
+        // CV Ramp
+        if (CV_Threshold_Ramp < CV_Threshold){
+            CV_Threshold_Ramp += rampRateCV;
+            if (CV_Threshold_Ramp > CV_Threshold){
+                CV_Threshold_Ramp = CV_Threshold;
+            }
+        } else if (CV_Threshold_Ramp > CV_Threshold){
+            CV_Threshold_Ramp -= rampRateCV;
+            if (CV_Threshold_Ramp < CV_Threshold){
+                CV_Threshold_Ramp = CV_Threshold;
+            }
+        }
+    } else {
+        // Reset DAC output to 0 if PSFB disabled
+        CC_Threshold_Ramp = 0;
+        CV_Threshold_Ramp = 0;
+    }
+
+
+    uint16_t CC_ThresholdRaw = ((CC_Threshold_Ramp - IOUT_OFFSET) * 0.4 + 0.5) / (3.3/4095);
+    DAC1->DHR12R1 = CC_ThresholdRaw;
+    // (CC_Threshold * 3.3/4095 - 2.5)  / -0.1;
+
+    uint16_t CV_ThresholdRaw = (CV_Threshold_Ramp * 1.5) / VOUT_SCALE / (3.3/4095);
+    DAC1->DHR12R2 = CV_ThresholdRaw;
+    // CV_Threshold * 3.3/4095 * 15.12 /  1.5;
+}
+
+
+
 volatile uint32_t timerTest = 0;
 
 void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
-    if (htim->Instance == TIM6)
+    if (htim->Instance == TIM6)     // 1 kHz
     {
+        rampCCCV();
         timerTest++;
     }
 }
+
+
 
 void lowpass(Measurements *meas, float x0){
 
     // https://www.earlevel.com/main/2021/09/02/biquad-calculator-v3/
     // 1kHz 10Hz cutoff
-    static const float b0 = 0.00094469146f;
-    static const float b1 = 0.00188938292f;
-    static const float b2 = 0.00094469146f;
-    static const float a1 = -1.9111962882f;
-    static const float a2 = 0.9149750541f;
+//    static const float b0 = 0.00094469146f;
+//    static const float b1 = 0.00188938292f;
+//    static const float b2 = 0.00094469146f;
+//    static const float a1 = -1.9111962882f;
+//    static const float a2 = 0.9149750541f;
+
+    // 1kHz 2Hz cutoff
+    static const float b0 = 0.00003913020209409091;
+    static const float b1 = 0.00007826040418818182;
+    static const float b2 = 0.00003913020209409091;
+    static const float a1 = -1.9822287623675816;
+    static const float a2 = 0.982385283175958;
 
     // Shift Values
     meas->x2 = meas->x1;
@@ -384,6 +458,52 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
     float Rntc3 =  (R_FIXED_TEMP * Vtemp3)/(3.3 - Vtemp3); **/
     }
 
+}
+
+void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
+{
+    RxDataLen = Size;
+
+    uint8_t cmd = UART2_RxBuffer[0];
+    float value = atoff((char *)(UART2_RxBuffer+2));
+
+    switch (cmd)
+    {
+    case 'V':
+        if (value <= 600 && value >= 0){
+            CV_Threshold = value;
+        }
+        break;
+
+    case 'C':
+        if (value <= 7.5 && value >= 0){
+            CC_Threshold = value;
+        }
+        break;
+
+    case 'R':
+        if (value > 0){
+            relay_enable = 1;
+        } else {
+            relay_enable = 0;
+        }
+        break;
+
+    case 'P':
+        if (value > 0){
+            psfb_enable = 1;
+        } else {
+            psfb_enable = 0;
+        }
+        break;
+    }
+
+    memset(UART2_RxBuffer, '\0', UART_RX_BUFFER_SIZE);
+
+//    HAL_UART_Transmit(&huart2, UART2_RxBuffer, RxDataLen, 100);
+//    memset(UART2_RxBuffer, '\0', UART_RX_BUFFER_SIZE);
+
+    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE);
 }
 
 
