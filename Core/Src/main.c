@@ -21,7 +21,6 @@
 #include "adc.h"
 #include "dac.h"
 #include "dma.h"
-#include "spi.h"
 #include "tim.h"
 #include "usart.h"
 #include "gpio.h"
@@ -53,28 +52,12 @@
 #define D1 6.3292612648746E-08f
 #define IOUT_OFFSET 0.98
 
-/* USER CODE END PD */
-
-/* Private macro -------------------------------------------------------------*/
-/* USER CODE BEGIN PM */
-
-/* USER CODE END PM */
-
-/* Private variables ---------------------------------------------------------*/
-
-/* USER CODE BEGIN PV */
-
-/* USER CODE END PV */
-
-/* Private function prototypes -----------------------------------------------*/
-void SystemClock_Config(void);
-/* USER CODE BEGIN PFP */
-
-
-/* USER CODE END PFP */
-
-/* Private user code ---------------------------------------------------------*/
-/* USER CODE BEGIN 0 */
+// Safety Limits
+#define LIMIT_VOUT_MAX 600.0
+#define LIMIT_VOUT_MIN  20.0
+#define LIMIT_IOUT_MAX   7.5
+#define LIMIT_IOUT_MIN   0.0
+#define LIMIT_POUT_MAX 3000.0
 
 volatile float duty = 0.1;
 volatile uint32_t deadtime = 0;
@@ -88,8 +71,7 @@ volatile uint8_t relay_enable = 0;
 
 float CC_Threshold = 3;
 float CC_Threshold_Ramp = 0;
-
-float CV_Threshold = 0;
+float CV_Threshold = LIMIT_VOUT_MIN;
 float CV_Threshold_Ramp = 0;
 
 float pfc_voltage_nominal = 40;
@@ -108,7 +90,6 @@ typedef struct {
     float x2;
 } Measurements;
 
-
 typedef struct {
     Measurements PFCCurrent;
     Measurements PFCVoltage;
@@ -117,15 +98,66 @@ typedef struct {
     Measurements OutputPower;
     Measurements BatteryVoltage;
     Measurements temp[3];
-} Sensors;
+} SensorsMeas;
 
-Sensors sensors = {0};
+SensorsMeas sensorsMeas = {0};
 
-#define UART_RX_BUFFER_SIZE 20
+typedef struct {
+    const float *PFCCurrent;
+    const float *PFCVoltage;
+    const float *OutputVoltage;
+    const float *OutputCurrent;
+    const float *OutputPower;
+    const float *BatteryVoltage;
+    const float *temp1;
+    const float *temp2;
+    const float *temp3;
+} SensorsVal;
+
+const volatile SensorsVal sensorsVal = {
+    .PFCCurrent = &sensorsMeas.PFCCurrent.val,
+    .PFCVoltage = &sensorsMeas.PFCVoltage.val,
+    .OutputVoltage = &sensorsMeas.OutputVoltage.val,
+    .OutputCurrent = &sensorsMeas.OutputCurrent.val,
+    .OutputPower = &sensorsMeas.OutputPower.val,
+    .BatteryVoltage = &sensorsMeas.BatteryVoltage.val,
+    .temp1 = &sensorsMeas.temp[0].val,
+    .temp2 = &sensorsMeas.temp[1].val,
+    .temp3 = &sensorsMeas.temp[2].val,
+};
+
+#define UART_RX_BUFFER_SIZE 256
 uint8_t UART2_RxBuffer[UART_RX_BUFFER_SIZE] = {0};
 uint16_t RxDataLen = 0;
 
+/* USER CODE END PD */
 
+/* Private macro -------------------------------------------------------------*/
+/* USER CODE BEGIN PM */
+
+/* USER CODE END PM */
+
+/* Private variables ---------------------------------------------------------*/
+
+/* USER CODE BEGIN PV */
+
+/* USER CODE END PV */
+
+/* Private function prototypes -----------------------------------------------*/
+void SystemClock_Config(void);
+/* USER CODE BEGIN PFP */
+
+static void lowpass(Measurements *meas, float x0);
+static void fanSpeedUpdate(void);
+static void CCCV_check(void);
+static void CCCV_ramp(void);
+static void enablePinsUpdate(void);
+
+
+/* USER CODE END PFP */
+
+/* Private user code ---------------------------------------------------------*/
+/* USER CODE BEGIN 0 */
 
 /* USER CODE END 0 */
 
@@ -163,7 +195,6 @@ int main(void)
   MX_USART2_UART_Init();
   MX_ADC2_Init();
   MX_DAC1_Init();
-  MX_SPI2_Init();
   MX_TIM1_Init();
   MX_TIM6_Init();
   MX_TIM8_Init();
@@ -207,56 +238,27 @@ int main(void)
     if (enable_update){
         uint8_t buff[128];
         uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f, Temp2:%7.2f, Temp3:%7.2f\n",
-                                    sensors.PFCVoltage.val,
-                                    sensors.OutputVoltage.val,
-                                    sensors.OutputCurrent.val,
-                                    sensors.BatteryVoltage.val,
-                                    sensors.OutputPower.val,
-                                    sensors.temp[0].val,
-                                    sensors.temp[1].val,
-                                    sensors.temp[2].val);
+                                    *sensorsVal.PFCVoltage,
+                                    *sensorsVal.OutputVoltage,
+                                    *sensorsVal.OutputCurrent,
+                                    *sensorsVal.BatteryVoltage,
+                                    *sensorsVal.OutputPower,
+                                    *sensorsVal.temp1,
+                                    *sensorsVal.temp2,
+                                    *sensorsVal.temp3);
 
         HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
 
 //        enable_update = 0;
 
         if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE) == HAL_ERROR){
-            Error_Handler();
+//            Error_Handler();
         }
     }
 
-//    if (sensors.PFCVoltage.val < pfc_voltage_nominal * (1+pfc_voltage_tolerance) &&
-//        sensors.PFCVoltage.val > pfc_voltage_nominal * (1-pfc_voltage_tolerance) &&
-//        psfb_enable){
-
-    if (psfb_enable){
-        HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, 1);
-    } else {
-        HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, 0);
-    }
-
-    HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
-
-
-    // Variable fan speed control
-    duty = (sensors.temp[2].val - 30) / 40;
-
-    if (duty > 1)
-        duty = 1;
-    if (duty < 0)
-        duty = 0;
-
-    TIM8->CCR1 = 1700 * duty;
-    TIM1->CCR1 = 1700 * duty;
-
-
-//    HAL_TIMEx_ConfigDeadTime(&htim8, deadtime);
-//    HAL_TIMEx_ConfigDeadTime(&htim1, deadtime);
-
-//        enable_update = 0;
-
-//    if (dac_val > 4095) dac_val = 0;
-//    DAC1->DHR12R2 = dac_val++;
+    CCCV_check();
+    fanSpeedUpdate();
+    enablePinsUpdate();
 
     HAL_Delay(100);
   }
@@ -313,10 +315,55 @@ void SystemClock_Config(void)
 
 
 
-static void rampCCCV(void)
-{
+
+
+static void enablePinsUpdate(void){
+    //    if (sensorsMeas.PFCVoltage.val < pfc_voltage_nominal * (1+pfc_voltage_tolerance) &&
+    //        sensorsMeas.PFCVoltage.val > pfc_voltage_nominal * (1-pfc_voltage_tolerance) &&
+    //        psfb_enable){
+
+    HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, psfb_enable);
+    HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
+}
+
+static void fanSpeedUpdate(void){
+    // Variable fan speed control
+    duty = (sensorsMeas.temp[2].val - 30) / 40;
+
+    if (duty > 1)
+        duty = 1;
+    if (duty < 0)
+        duty = 0;
+
+    TIM8->CCR1 = 1700 * duty;
+    TIM1->CCR1 = 1700 * duty;
+}
+
+
+static void CCCV_check(void){
+    if (CC_Threshold > LIMIT_IOUT_MAX){
+        CC_Threshold = LIMIT_IOUT_MAX;
+    } else
+    if (CC_Threshold < LIMIT_IOUT_MIN){
+        CC_Threshold = LIMIT_IOUT_MIN;
+    }
+
+    if (CV_Threshold > LIMIT_VOUT_MAX){
+        CV_Threshold = LIMIT_VOUT_MAX;
+    } else
+    if (CV_Threshold < LIMIT_VOUT_MIN){
+        CV_Threshold = LIMIT_VOUT_MIN;
+    }
+
+    if (CC_Threshold * CV_Threshold > LIMIT_POUT_MAX){
+        CC_Threshold = LIMIT_POUT_MAX / CV_Threshold; // Pout limit by adjusting CC
+    }
+}
+
+
+static void CCCV_ramp(void){
     // Divide by 1000 for 1kHz
-    static const float rampRateCC = 0.2 / 1000.0;
+    static const float rampRateCC = 0.5 / 1000.0;
     static const float rampRateCV = 50  / 1000.0;
 
     if (psfb_enable){
@@ -346,10 +393,22 @@ static void rampCCCV(void)
         }
     } else {
         // Reset DAC output to 0 if PSFB disabled
-        CC_Threshold_Ramp = 0;
-        CV_Threshold_Ramp = 0;
+        CC_Threshold_Ramp = LIMIT_IOUT_MIN;
+        CV_Threshold_Ramp = LIMIT_VOUT_MIN;
     }
 
+    // Clamp result for safety
+    // TODO: CALL ERROR
+    if (CC_Threshold_Ramp < LIMIT_IOUT_MIN){
+        CC_Threshold_Ramp = LIMIT_IOUT_MIN;
+    } else if (CC_Threshold_Ramp > LIMIT_IOUT_MAX){
+        CC_Threshold_Ramp = LIMIT_IOUT_MAX;
+    }
+    if (CV_Threshold_Ramp < LIMIT_VOUT_MIN){
+        CV_Threshold_Ramp = LIMIT_VOUT_MIN;
+    } else if (CV_Threshold_Ramp > LIMIT_VOUT_MAX){
+        CV_Threshold_Ramp = LIMIT_VOUT_MAX;
+    }
 
     uint16_t CC_ThresholdRaw = ((CC_Threshold_Ramp - IOUT_OFFSET) * 0.4 + 0.5) / (3.3/4095);
     DAC1->DHR12R1 = CC_ThresholdRaw;
@@ -361,21 +420,7 @@ static void rampCCCV(void)
 }
 
 
-
-volatile uint32_t timerTest = 0;
-
-void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
-{
-    if (htim->Instance == TIM6)     // 1 kHz
-    {
-        rampCCCV();
-        timerTest++;
-    }
-}
-
-
-
-void lowpass(Measurements *meas, float x0){
+static void lowpass(Measurements *meas, float x0){
 
     // https://www.earlevel.com/main/2021/09/02/biquad-calculator-v3/
     // 1kHz 10Hz cutoff
@@ -408,18 +453,30 @@ void lowpass(Measurements *meas, float x0){
 }
 
 
+volatile uint32_t timerTest = 0;
+
+void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
+{
+    if (htim->Instance == TIM6)     // 1 kHz
+    {
+        CCCV_ramp();
+        timerTest++;
+    }
+}
+
+
 void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 {
 //    adcVal = HAL_ADC_GetValue(&hadc1); // Read & Update The ADC Result
     if (hadc->Instance == ADC1)
     {
-        lowpass(&sensors.PFCVoltage,      adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5);
-        lowpass(&sensors.OutputVoltage,   adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5);
-        lowpass(&sensors.OutputCurrent,  (adc_buffer[2] * 3.3/4095 - 0.5) / 0.4 + IOUT_OFFSET);
-        lowpass(&sensors.BatteryVoltage,  adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5);
-        lowpass(&sensors.PFCCurrent,      adc_buffer[4]);
+        lowpass(&sensorsMeas.PFCVoltage,      adc_buffer[0] * 3.3/4095 * VPFC_SCALE /  1.5);
+        lowpass(&sensorsMeas.OutputVoltage,   adc_buffer[1] * 3.3/4095 * VOUT_SCALE /  1.5);
+        lowpass(&sensorsMeas.OutputCurrent,  (adc_buffer[2] * 3.3/4095 - 0.5) / 0.4 + IOUT_OFFSET);
+        lowpass(&sensorsMeas.BatteryVoltage,  adc_buffer[3] * 3.3/4095 * VOUT_SCALE /  1.5);
+        lowpass(&sensorsMeas.PFCCurrent,      adc_buffer[4]);
 
-        lowpass(&sensors.OutputPower,     sensors.OutputVoltage.val * sensors.OutputCurrent.val);
+        lowpass(&sensorsMeas.OutputPower,     sensorsMeas.OutputVoltage.val * sensorsMeas.OutputCurrent.val);
 
     }
     
@@ -446,7 +503,7 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
             else if (_temp[i] < -10.0f)
                 _temp[i] = -10.0f;
 
-            lowpass(&sensors.temp[i], _temp[i]);
+            lowpass(&sensorsMeas.temp[i], _temp[i]);
         }
 
     /**float Vtemp1 = adc2_buffer[0] * 3.3/4095; 
@@ -470,13 +527,13 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
     switch (cmd)
     {
     case 'V':
-        if (value <= 600 && value >= 0){
+        if (value <= LIMIT_VOUT_MAX && value >= LIMIT_VOUT_MIN){
             CV_Threshold = value;
         }
         break;
 
     case 'C':
-        if (value <= 7.5 && value >= 0){
+        if (value <= LIMIT_IOUT_MAX && value >= LIMIT_IOUT_MIN){
             CC_Threshold = value;
         }
         break;
