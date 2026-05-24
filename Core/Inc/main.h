@@ -53,6 +53,7 @@ extern "C" {
 void Error_Handler(void);
 
 /* USER CODE BEGIN EFP */
+void uart_parseRxFrame(uint8_t* buffer, uint32_t len);
 
 /* USER CODE END EFP */
 

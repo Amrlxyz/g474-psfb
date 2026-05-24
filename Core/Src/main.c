@@ -31,6 +31,7 @@
 #include "math.h"
 #include "stdlib.h"
 #include "string.h"
+#include "charger_uart.h"
 
 /* USER CODE END Includes */
 
@@ -126,10 +127,6 @@ const volatile SensorsVal sensorsVal = {
     .temp3 = &sensorsMeas.temp[2].val,
 };
 
-#define UART_RX_BUFFER_SIZE 256
-uint8_t UART2_RxBuffer[UART_RX_BUFFER_SIZE] = {0};
-uint16_t RxDataLen = 0;
-
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -224,7 +221,8 @@ int main(void)
   HAL_DAC_Start(&hdac1, DAC1_CHANNEL_1);
   HAL_DAC_Start(&hdac1, DAC1_CHANNEL_2);
 
-  HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE);
+
+  uart_init();
 
 //  uint16_t dac_val = 0;
   /* USER CODE END 2 */
@@ -235,26 +233,16 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    if (enable_update){
-        uint8_t buff[128];
-        uint16_t buffSize = sprintf((char *)buff, "Vin:%7.2f, Vout:%7.2f, Iout:%7.3f, Vbat:%7.2f, Pout:%7.2f, Temp1:%7.2f, Temp2:%7.2f, Temp3:%7.2f\n",
-                                    *sensorsVal.PFCVoltage,
-                                    *sensorsVal.OutputVoltage,
-                                    *sensorsVal.OutputCurrent,
-                                    *sensorsVal.BatteryVoltage,
-                                    *sensorsVal.OutputPower,
-                                    *sensorsVal.temp1,
-                                    *sensorsVal.temp2,
-                                    *sensorsVal.temp3);
-
-        HAL_UART_Transmit(&huart2, buff, buffSize, HAL_MAX_DELAY);
-
-//        enable_update = 0;
-
-        if (HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE) == HAL_ERROR){
-//            Error_Handler();
-        }
-    }
+    printfDma("VI:%7.2f, VO:%7.2f, IO:%7.3f, VB:%7.2f, PO:%9.2f, T1:%7.2f, T2:%7.2f, T3:%7.2f\n",
+                *sensorsVal.PFCVoltage,
+                *sensorsVal.OutputVoltage,
+                *sensorsVal.OutputCurrent,
+                *sensorsVal.BatteryVoltage,
+                *sensorsVal.OutputPower,
+                *sensorsVal.temp1,
+                *sensorsVal.temp2,
+                *sensorsVal.temp3
+                );
 
     CCCV_check();
     fanSpeedUpdate();
@@ -313,8 +301,68 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
 
+    // LV MCU UART Example with sscanf:
 
+//    static float PFCVoltage;
+//    static float OutputVoltage;
+//    static float OutputCurrent;
+//    static float BatteryVoltage;
+//    static float OutputPower;
+//    static float temp1;
+//    static float temp2;
+//    static float temp3;
+//
+//    if (sscanf((char *)buffer, "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f\n",
+//           &PFCVoltage,
+//           &OutputVoltage,
+//           &OutputCurrent,
+//           &BatteryVoltage,
+//           &OutputPower,
+//           &temp1,
+//           &temp2,
+//           &temp3) == 8){
+//        printfDma("Recieved\n"); // Not recommended to call printfDma in ISR
+//    }
+
+    if (len < 4) // Including '/n'
+        return;
+
+    uint8_t cmd = buffer[0];
+    float value = atoff((char *)(buffer+2));
+
+    switch (cmd)
+    {
+    case 'V':
+        if (value <= LIMIT_VOUT_MAX && value >= LIMIT_VOUT_MIN){
+            CV_Threshold = value;
+        }
+        break;
+
+    case 'C':
+        if (value <= LIMIT_IOUT_MAX && value >= LIMIT_IOUT_MIN){
+            CC_Threshold = value;
+        }
+        break;
+
+    case 'R':
+        if (value > 0){
+            relay_enable = 1;
+        } else {
+            relay_enable = 0;
+        }
+        break;
+
+    case 'P':
+        if (value > 0){
+            psfb_enable = 1;
+        } else {
+            psfb_enable = 0;
+        }
+        break;
+    }
+}
 
 
 static void enablePinsUpdate(void){
@@ -517,51 +565,6 @@ void HAL_ADC_ConvCpltCallback(ADC_HandleTypeDef* hadc)
 
 }
 
-void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size)
-{
-    RxDataLen = Size;
-
-    uint8_t cmd = UART2_RxBuffer[0];
-    float value = atoff((char *)(UART2_RxBuffer+2));
-
-    switch (cmd)
-    {
-    case 'V':
-        if (value <= LIMIT_VOUT_MAX && value >= LIMIT_VOUT_MIN){
-            CV_Threshold = value;
-        }
-        break;
-
-    case 'C':
-        if (value <= LIMIT_IOUT_MAX && value >= LIMIT_IOUT_MIN){
-            CC_Threshold = value;
-        }
-        break;
-
-    case 'R':
-        if (value > 0){
-            relay_enable = 1;
-        } else {
-            relay_enable = 0;
-        }
-        break;
-
-    case 'P':
-        if (value > 0){
-            psfb_enable = 1;
-        } else {
-            psfb_enable = 0;
-        }
-        break;
-    }
-
-    memset(UART2_RxBuffer, '\0', UART_RX_BUFFER_SIZE);
-
-//    HAL_UART_Transmit(&huart2, UART2_RxBuffer, RxDataLen, 100);
-//    memset(UART2_RxBuffer, '\0', UART_RX_BUFFER_SIZE);
-
-    HAL_UARTEx_ReceiveToIdle_DMA(&huart2, UART2_RxBuffer, UART_RX_BUFFER_SIZE);
-}
 
 
 /* USER CODE END 4 */
