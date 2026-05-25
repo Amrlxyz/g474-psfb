@@ -54,15 +54,18 @@
 #define IOUT_OFFSET 0.98
 
 // Safety Limits
-#define LIMIT_VOUT_MAX 600.0
-#define LIMIT_VOUT_MIN  20.0
-#define LIMIT_IOUT_MAX   7.5
-#define LIMIT_IOUT_MIN   0.0
+#define LIMIT_VOUT_MAX  600.0
+#define LIMIT_VOUT_MIN   20.0
+#define LIMIT_IOUT_MAX    7.5
+#define LIMIT_IOUT_MIN    0.0
 #define LIMIT_POUT_MAX 3000.0
+#define LIMIT_VIN_MIN   370.0
+
+#define LIMIT_MAX_TOLERANCE 1.05
+//#define LIMIT_MIN_TOLERANCE 0.95
 
 volatile float duty = 0.1;
 volatile uint32_t deadtime = 0;
-volatile uint8_t enable_update = 1;
 
 volatile uint16_t adc_buffer[ADC_BUFFER_SIZE];
 volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE];
@@ -127,6 +130,38 @@ const volatile SensorsVal sensorsVal = {
     .temp3 = &sensorsMeas.temp[2].val,
 };
 
+typedef enum {
+    CHARGER_STATE_IDLE,
+    CHARGER_STATE_STARTUP,
+    CHARGER_STATE_ACTIVE,
+    CHARGER_STATE_SHUTDOWN,
+    CHARGER_STATE_ERROR,
+    CHARGER_STATE_TOTAL
+} Charger_states;
+
+char *CHARGER_STATE_STRING[CHARGER_STATE_TOTAL] = {
+    "IDLE",
+    "STARTUP",
+    "ACTIVE",
+    "SHUTDOWN",
+    "ERROR",
+};
+
+Charger_states volatile charger_state = CHARGER_STATE_IDLE;
+Charger_states volatile charger_state_prev = CHARGER_STATE_IDLE;
+
+
+typedef enum {
+    CMD_SET_CV = 'V',
+    CMD_SET_CC = 'C',
+    CMD_EN_RELAY = 'R',
+    CMD_EN_PSFB = 'P',
+    CMD_START = 'S',
+    CMD_INVALID = -1,
+} uart_cmds;
+
+volatile uart_cmds uart_cmd_recieved = 0;
+
 /* USER CODE END PD */
 
 /* Private macro -------------------------------------------------------------*/
@@ -149,6 +184,7 @@ static void fanSpeedUpdate(void);
 static void CCCV_check(void);
 static void CCCV_ramp(void);
 static void enablePinsUpdate(void);
+static void charger_startup(void);
 
 
 /* USER CODE END PFP */
@@ -244,9 +280,23 @@ int main(void)
                 *sensorsVal.temp3
                 );
 
+    if (uart_cmd_recieved){
+        if (uart_cmd_recieved == CMD_INVALID){
+            printfDma("UART CMD INVALID\n");
+        } else {
+            printfDma("UART CMD RECIEVED = %c\n", uart_cmd_recieved);
+        }
+        uart_cmd_recieved = 0;
+    }
+
+    if (charger_state_prev != charger_state){
+        printfDma("New State = %s\n", CHARGER_STATE_STRING[charger_state]);
+        charger_state_prev = charger_state;
+    }
+
     CCCV_check();
     fanSpeedUpdate();
-    enablePinsUpdate();
+
 
     HAL_Delay(100);
   }
@@ -301,6 +351,40 @@ void SystemClock_Config(void)
 
 /* USER CODE BEGIN 4 */
 
+
+static uint8_t charger_checkErrors(void){
+
+    uint8_t errorCode = 0;
+
+    // Check if input voltage suddenly drops
+    if (*sensorsVal.PFCVoltage < LIMIT_VIN_MIN){
+        errorCode |= 0x01;
+    }
+
+    // Check for over-current/voltage/power
+    if (*sensorsVal.OutputCurrent > LIMIT_IOUT_MAX * LIMIT_MAX_TOLERANCE){
+        errorCode |= 0x02;
+    }
+    if (*sensorsVal.OutputVoltage > LIMIT_VOUT_MAX * LIMIT_MAX_TOLERANCE){
+        errorCode |= 0x04;
+    }
+    if (*sensorsVal.OutputPower > LIMIT_POUT_MAX * LIMIT_MAX_TOLERANCE){
+        errorCode |= 0x08;
+    }
+
+    return errorCode;
+}
+
+static void charger_startup(void){
+    if (charger_state != CHARGER_STATE_IDLE){
+        return;
+    }
+
+    charger_state = CHARGER_STATE_STARTUP;
+    psfb_enable = 1;
+}
+
+
 void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
 
     // LV MCU UART Example with sscanf:
@@ -326,27 +410,29 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
 //        printfDma("Recieved\n"); // Not recommended to call printfDma in ISR
 //    }
 
-    if (len < 4) // Including '/n'
+    if (len < 2) // Including '/n'
         return;
 
     uint8_t cmd = buffer[0];
     float value = atoff((char *)(buffer+2));
 
+    uart_cmd_recieved = cmd;
+
     switch (cmd)
     {
-    case 'V':
+    case CMD_SET_CV:
         if (value <= LIMIT_VOUT_MAX && value >= LIMIT_VOUT_MIN){
             CV_Threshold = value;
         }
         break;
 
-    case 'C':
+    case CMD_SET_CC:
         if (value <= LIMIT_IOUT_MAX && value >= LIMIT_IOUT_MIN){
             CC_Threshold = value;
         }
         break;
 
-    case 'R':
+    case CMD_EN_RELAY:
         if (value > 0){
             relay_enable = 1;
         } else {
@@ -354,22 +440,33 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
         }
         break;
 
-    case 'P':
+    case CMD_EN_PSFB:
         if (value > 0){
             psfb_enable = 1;
         } else {
             psfb_enable = 0;
         }
         break;
+
+    case CMD_START:
+        if (charger_state == CHARGER_STATE_IDLE){
+            charger_startup();
+        } else {
+            charger_state = CHARGER_STATE_SHUTDOWN;
+        }
+        break;
+
+    default:
+        uart_cmd_recieved = CMD_INVALID;
+        break;
     }
+
+
+    memset(buffer, '\0', len);
 }
 
 
 static void enablePinsUpdate(void){
-    //    if (sensorsMeas.PFCVoltage.val < pfc_voltage_nominal * (1+pfc_voltage_tolerance) &&
-    //        sensorsMeas.PFCVoltage.val > pfc_voltage_nominal * (1-pfc_voltage_tolerance) &&
-    //        psfb_enable){
-
     HAL_GPIO_WritePin(EN_PSFB_GPIO_Port, EN_PSFB_Pin, psfb_enable);
     HAL_GPIO_WritePin(EN_PFC_GPIO_Port,  EN_PFC_Pin,  relay_enable);
 }
@@ -507,8 +604,53 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)     // 1 kHz
     {
-        CCCV_ramp();
         timerTest++;
+        CCCV_ramp();
+        CCCV_check();
+
+        uint8_t errorCode = charger_checkErrors();
+
+        switch (charger_state){
+
+        case CHARGER_STATE_IDLE:
+            break;
+
+        case CHARGER_STATE_STARTUP:
+            // Precharge check before relay ON
+            if (*sensorsVal.OutputVoltage > *sensorsVal.BatteryVoltage * 0.90){
+                relay_enable = 1;
+                charger_state = CHARGER_STATE_ACTIVE;
+            }
+            break;
+
+        case CHARGER_STATE_ACTIVE:
+            if (errorCode){
+                relay_enable = 0;
+                psfb_enable = 0;
+                charger_state = CHARGER_STATE_ERROR;
+
+                printfDma("ERROR=%d\n", errorCode);
+            }
+            break;
+
+        case CHARGER_STATE_ERROR:
+            if (!errorCode){
+                charger_state = CHARGER_STATE_IDLE;
+            }
+            break;
+
+        case CHARGER_STATE_SHUTDOWN:
+            relay_enable = 0;
+            psfb_enable = 0;
+            charger_state = CHARGER_STATE_IDLE;
+            break;
+
+        default:
+            break;
+        }
+
+        enablePinsUpdate();
+
     }
 }
 
