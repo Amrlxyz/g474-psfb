@@ -95,7 +95,7 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
                 break;
             }
 
-            if (rxframe_tail > UART_RX_BUF_SZ){
+            if (rxframe_tail >= UART_RX_BUF_SZ){
                 rxframe_tail = 0;
             }
         }
@@ -110,7 +110,7 @@ void HAL_UART_ErrorCallback(UART_HandleTypeDef *huart)
         HAL_UARTEx_ReceiveToIdle_DMA(&uartHandle, rxbuffer, UART_RX_BUF_SZ);
         rxframe_tail = 0;
         rxframe_len = 0;
-        printfDma("UART ERROR Detected\n");
+        printfDma("// UART ERROR Detected\n");
     }
 }
 
@@ -188,6 +188,8 @@ int printfDma(const char *format, ...)
     int written = vsnprintf(temp_buffer, TEMP_BUFF_SIZE, format, args);
     va_end(args);
 
+    __disable_irq();
+
     if (written < 0)
     {
         return -1; // Error in formatting
@@ -215,10 +217,12 @@ int printfDma(const char *format, ...)
 
         if (head == tail)
         {
-            printfDma("\n\n UART BUFFER FULL DATA OVERWRITTEN \n\n");
+//            printfDma("\n\n UART BUFFER FULL DATA OVERWRITTEN \n\n");
 //            Error_Handler();
         }
     }
+
+    __enable_irq();
 
     uint32_t uart_state = HAL_UART_GetState(&uartHandle);
 

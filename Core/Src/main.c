@@ -282,15 +282,15 @@ int main(void)
 
     if (uart_cmd_recieved){
         if (uart_cmd_recieved == CMD_INVALID){
-            printfDma("UART CMD INVALID\n");
+            printfDma("// UART CMD INVALID\n");
         } else {
-            printfDma("UART CMD RECIEVED = %c\n", uart_cmd_recieved);
+            printfDma("// UART CMD RECIEVED = [%c]\n", uart_cmd_recieved);
         }
         uart_cmd_recieved = 0;
     }
 
     if (charger_state_prev != charger_state){
-        printfDma("New State = %s\n", CHARGER_STATE_STRING[charger_state]);
+        printfDma("// New State = [%s]\n", CHARGER_STATE_STRING[charger_state]);
         charger_state_prev = charger_state;
     }
 
@@ -407,7 +407,7 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
 //           &temp1,
 //           &temp2,
 //           &temp3) == 8){
-//        printfDma("Recieved\n"); // Not recommended to call printfDma in ISR
+//        printfDma("// Recieved\n"); // Not recommended to call printfDma in ISR
 //    }
 
     if (len < 2) // Including '/n'
@@ -629,7 +629,7 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
                 psfb_enable = 0;
                 charger_state = CHARGER_STATE_ERROR;
 
-                printfDma("ERROR=%d\n", errorCode);
+                printfDma("// ERROR DETECTED = [%d]\n", errorCode);
             }
             break;
 
