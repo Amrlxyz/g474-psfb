@@ -60,6 +60,7 @@
 #define LIMIT_IOUT_MIN    0.0
 #define LIMIT_POUT_MAX 3000.0
 #define LIMIT_VIN_MIN   370.0
+#define LIMIT_TEMP_MAX   80.0
 
 #define LIMIT_MAX_TOLERANCE 1.05
 //#define LIMIT_MIN_TOLERANCE 0.95
@@ -72,6 +73,8 @@ volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE];
 
 volatile uint8_t psfb_enable = 0;
 volatile uint8_t relay_enable = 0;
+
+volatile uint8_t charger_errorCode = 0;
 
 float CC_Threshold = 3;
 float CC_Threshold_Ramp = 0;
@@ -132,7 +135,7 @@ const volatile SensorsVal sensorsVal = {
 
 typedef enum {
     CHARGER_STATE_IDLE,
-    CHARGER_STATE_STARTUP,
+    CHARGER_STATE_PRECHARGE,
     CHARGER_STATE_ACTIVE,
     CHARGER_STATE_SHUTDOWN,
     CHARGER_STATE_ERROR,
@@ -141,7 +144,7 @@ typedef enum {
 
 char *CHARGER_STATE_STRING[CHARGER_STATE_TOTAL] = {
     "IDLE",
-    "STARTUP",
+    "PRECHARGE",
     "ACTIVE",
     "SHUTDOWN",
     "ERROR",
@@ -260,6 +263,8 @@ int main(void)
 
   uart_init();
 
+  HAL_GPIO_WritePin(RELAY_CTRL_GPIO_Port, RELAY_CTRL_Pin, 1); // This is actually connected to PFC EN
+
 //  uint16_t dac_val = 0;
   /* USER CODE END 2 */
 
@@ -269,7 +274,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    printfDma("VI:%7.2f, VO:%7.2f, IO:%7.3f, VB:%7.2f, PO:%9.2f, T1:%7.2f, T2:%7.2f, T3:%7.2f\n",
+    printfDma("VI:%7.2f, VO:%7.2f, IO:%7.3f, VB:%7.2f, PO:%9.2f, T1:%7.2f, T2:%7.2f, T3:%7.2f, ST:%1d, ER:%02x\n",
                 *sensorsVal.PFCVoltage,
                 *sensorsVal.OutputVoltage,
                 *sensorsVal.OutputCurrent,
@@ -277,7 +282,9 @@ int main(void)
                 *sensorsVal.OutputPower,
                 *sensorsVal.temp1,
                 *sensorsVal.temp2,
-                *sensorsVal.temp3
+                *sensorsVal.temp3,
+                charger_state,
+                charger_errorCode
                 );
 
     if (uart_cmd_recieved){
@@ -372,6 +379,11 @@ static uint8_t charger_checkErrors(void){
         errorCode |= 0x08;
     }
 
+    // Temp Sensors
+    if (*sensorsVal.temp1 > LIMIT_TEMP_MAX){
+        errorCode |= 0x10;
+    }
+
     return errorCode;
 }
 
@@ -380,7 +392,7 @@ static void charger_startup(void){
         return;
     }
 
-    charger_state = CHARGER_STATE_STARTUP;
+    charger_state = CHARGER_STATE_PRECHARGE;
     psfb_enable = 1;
 }
 
@@ -473,12 +485,14 @@ static void enablePinsUpdate(void){
 
 static void fanSpeedUpdate(void){
     // Variable fan speed control
-    duty = (sensorsMeas.temp[2].val - 30) / 40;
-
-    if (duty > 1)
-        duty = 1;
-    if (duty < 0)
-        duty = 0;
+//    duty = (sensorsMeas.temp[2].val - 30) / 40;
+//
+//    if (duty > 1)
+//        duty = 1;
+//    if (duty < 0)
+//        duty = 0;
+//
+    duty = 1.0;
 
     TIM8->CCR1 = 1700 * duty;
     TIM1->CCR1 = 1700 * duty;
@@ -608,14 +622,14 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         CCCV_ramp();
         CCCV_check();
 
-        uint8_t errorCode = charger_checkErrors();
+        charger_errorCode = charger_checkErrors();
 
         switch (charger_state){
 
         case CHARGER_STATE_IDLE:
             break;
 
-        case CHARGER_STATE_STARTUP:
+        case CHARGER_STATE_PRECHARGE:
             // Precharge check before relay ON
             if (*sensorsVal.OutputVoltage > *sensorsVal.BatteryVoltage * 0.90){
                 relay_enable = 1;
@@ -624,17 +638,17 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
             break;
 
         case CHARGER_STATE_ACTIVE:
-            if (errorCode){
+            if (charger_errorCode){
                 relay_enable = 0;
                 psfb_enable = 0;
                 charger_state = CHARGER_STATE_ERROR;
 
-                printfDma("// ERROR DETECTED = [%d]\n", errorCode);
+                printfDma("// ERROR DETECTED = [%d]\n", charger_errorCode);
             }
             break;
 
         case CHARGER_STATE_ERROR:
-            if (!errorCode){
+            if (!charger_errorCode){
                 charger_state = CHARGER_STATE_IDLE;
             }
             break;
