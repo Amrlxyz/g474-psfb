@@ -61,6 +61,7 @@
 #define LIMIT_POUT_MAX 3000.0
 #define LIMIT_VIN_MIN   370.0
 #define LIMIT_TEMP_MAX   80.0
+#define LIMIT_VBAT_DETECT_MIN   5.0
 
 #define LIMIT_MAX_TOLERANCE 1.05
 //#define LIMIT_MIN_TOLERANCE 0.95
@@ -135,6 +136,7 @@ const volatile SensorsVal sensorsVal = {
 
 typedef enum {
     CHARGER_STATE_IDLE,
+    CHARGER_STATE_IDLE_BATT,
     CHARGER_STATE_PRECHARGE,
     CHARGER_STATE_ACTIVE,
     CHARGER_STATE_SHUTDOWN,
@@ -388,7 +390,8 @@ static uint8_t charger_checkErrors(void){
 }
 
 static void charger_startup(void){
-    if (charger_state != CHARGER_STATE_IDLE){
+    if (charger_state != CHARGER_STATE_IDLE &&
+        charger_state != CHARGER_STATE_IDLE_BATT){
         return;
     }
 
@@ -461,7 +464,8 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
         break;
 
     case CMD_START:
-        if (charger_state == CHARGER_STATE_IDLE){
+        if (charger_state == CHARGER_STATE_IDLE ||
+            charger_state == CHARGER_STATE_IDLE_BATT){
             charger_startup();
         } else {
             charger_state = CHARGER_STATE_SHUTDOWN;
@@ -627,6 +631,15 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
         switch (charger_state){
 
         case CHARGER_STATE_IDLE:
+            if (*sensorsVal.BatteryVoltage > LIMIT_VBAT_DETECT_MIN){
+                charger_state = CHARGER_STATE_IDLE_BATT;
+            }
+            break;
+
+        case CHARGER_STATE_IDLE_BATT:
+            if (*sensorsVal.BatteryVoltage < LIMIT_VBAT_DETECT_MIN){
+                charger_state = CHARGER_STATE_IDLE;
+            }
             break;
 
         case CHARGER_STATE_PRECHARGE:
