@@ -61,7 +61,9 @@
 #define LIMIT_POUT_MAX 3000.0
 #define LIMIT_VIN_MIN   370.0
 #define LIMIT_TEMP_MAX   80.0
+#define LIMIT_VBAT_MAX  600.0
 #define LIMIT_VBAT_DETECT_MIN   5.0
+
 
 #define LIMIT_MAX_TOLERANCE 1.05
 //#define LIMIT_MIN_TOLERANCE 0.95
@@ -74,16 +76,13 @@ volatile uint16_t adc2_buffer[ADC2_BUFFER_SIZE];
 
 volatile uint8_t psfb_enable = 0;
 volatile uint8_t relay_enable = 0;
-
-volatile uint8_t charger_errorCode = 0;
+volatile uint8_t is_startButtonPressed = 0;
+volatile uint8_t is_dischargeCommandRx = 0;
 
 float CC_Threshold = 3;
 float CC_Threshold_Ramp = 0;
 float CV_Threshold = LIMIT_VOUT_MIN;
 float CV_Threshold_Ramp = 0;
-
-float pfc_voltage_nominal = 40;
-float pfc_voltage_tolerance = 0.1;
 
 
 typedef struct {
@@ -139,16 +138,17 @@ typedef enum {
     CHARGER_STATE_IDLE_BATT,
     CHARGER_STATE_PRECHARGE,
     CHARGER_STATE_ACTIVE,
-    CHARGER_STATE_SHUTDOWN,
+    CHARGER_STATE_DISCHARGE,
     CHARGER_STATE_ERROR,
     CHARGER_STATE_TOTAL
 } Charger_states;
 
 char *CHARGER_STATE_STRING[CHARGER_STATE_TOTAL] = {
     "IDLE",
+    "IDLE_BATT_CONNECTED",
     "PRECHARGE",
     "ACTIVE",
-    "SHUTDOWN",
+    "DISCHARGE",
     "ERROR",
 };
 
@@ -156,16 +156,34 @@ Charger_states volatile charger_state = CHARGER_STATE_IDLE;
 Charger_states volatile charger_state_prev = CHARGER_STATE_IDLE;
 
 
+
 typedef enum {
     CMD_SET_CV = 'V',
     CMD_SET_CC = 'C',
-    CMD_EN_RELAY = 'R',
-    CMD_EN_PSFB = 'P',
-    CMD_START = 'S',
+//    CMD_EN_RELAY = 'R',
+//    CMD_EN_PSFB = 'P',
+    CMD_START_BUTTON = 'S',
+    CMD_FAULT = 'F',
+    CMD_DISCHARGE = 'D',
     CMD_INVALID = -1,
 } uart_cmds;
 
-volatile uart_cmds uart_cmd_recieved = 0;
+typedef enum {
+    ERR_UART_TIMEOUT    = 0x0001,
+    ERR_LV_FAULT        = 0x0002,
+    ERR_VIN_UV          = 0x0004,
+    ERR_VIN_OV          = 0x0008,
+    ERR_VOUT_OV         = 0x0010,
+    ERR_IOUT_OC         = 0x0020,
+    ERR_POUT_OP         = 0x0040,
+    ERR_TEMP_OT         = 0x0080,
+    ERR_VBAT_REVERSE    = 0x0100,
+    ERR_VBAT_OV         = 0x0200,
+} charger_err_codes;
+
+volatile charger_err_codes charger_error_code = 0;
+volatile uint8_t charger_error_lv = 0;
+volatile uint8_t charger_error_uartCounter = 0;
 
 /* USER CODE END PD */
 
@@ -189,7 +207,6 @@ static void fanSpeedUpdate(void);
 static void CCCV_check(void);
 static void CCCV_ramp(void);
 static void enablePinsUpdate(void);
-static void charger_startup(void);
 
 
 /* USER CODE END PFP */
@@ -276,7 +293,7 @@ int main(void)
     /* USER CODE END WHILE */
 
     /* USER CODE BEGIN 3 */
-    printfDma("VI:%7.2f, VO:%7.2f, IO:%7.3f, VB:%7.2f, PO:%9.2f, T1:%7.2f, T2:%7.2f, T3:%7.2f, ST:%1d, ER:%02x\n",
+    printfDma("\\VI:%7.2f, VO:%7.2f, IO:%7.3f, VB:%7.2f, PO:%9.2f, T1:%7.2f, T2:%7.2f, T3:%7.2f, ST:%1d, ER:%04x\n",
                 *sensorsVal.PFCVoltage,
                 *sensorsVal.OutputVoltage,
                 *sensorsVal.OutputCurrent,
@@ -286,26 +303,11 @@ int main(void)
                 *sensorsVal.temp2,
                 *sensorsVal.temp3,
                 charger_state,
-                charger_errorCode
+                charger_error_code
                 );
-
-    if (uart_cmd_recieved){
-        if (uart_cmd_recieved == CMD_INVALID){
-            printfDma("// UART CMD INVALID\n");
-        } else {
-            printfDma("// UART CMD RECIEVED = [%c]\n", uart_cmd_recieved);
-        }
-        uart_cmd_recieved = 0;
-    }
-
-    if (charger_state_prev != charger_state){
-        printfDma("// New State = [%s]\n", CHARGER_STATE_STRING[charger_state]);
-        charger_state_prev = charger_state;
-    }
 
     CCCV_check();
     fanSpeedUpdate();
-
 
     HAL_Delay(100);
   }
@@ -361,77 +363,60 @@ void SystemClock_Config(void)
 /* USER CODE BEGIN 4 */
 
 
-static uint8_t charger_checkErrors(void){
+static uint32_t charger_checkErrors(void){
 
-    uint8_t errorCode = 0;
+    uint32_t errorCode = 0;
+
+    if (charger_error_uartCounter > 10){
+        errorCode |= ERR_UART_TIMEOUT;
+    }
+
+    if (charger_error_lv){
+        errorCode |= ERR_LV_FAULT;
+    }
 
     // Check if input voltage suddenly drops
     if (*sensorsVal.PFCVoltage < LIMIT_VIN_MIN){
-        errorCode |= 0x01;
+        errorCode |= ERR_VIN_UV;
     }
 
-    // Check for over-current/voltage/power
-    if (*sensorsVal.OutputCurrent > LIMIT_IOUT_MAX * LIMIT_MAX_TOLERANCE){
-        errorCode |= 0x02;
-    }
+    // Check for overvoltage/current/power
     if (*sensorsVal.OutputVoltage > LIMIT_VOUT_MAX * LIMIT_MAX_TOLERANCE){
-        errorCode |= 0x04;
+        errorCode |= ERR_VOUT_OV;
+    }
+    if (*sensorsVal.OutputCurrent > LIMIT_IOUT_MAX * LIMIT_MAX_TOLERANCE){
+        errorCode |= ERR_IOUT_OC;
     }
     if (*sensorsVal.OutputPower > LIMIT_POUT_MAX * LIMIT_MAX_TOLERANCE){
-        errorCode |= 0x08;
+        errorCode |= ERR_POUT_OP;
     }
 
     // Temp Sensors
-    if (*sensorsVal.temp1 > LIMIT_TEMP_MAX){
-        errorCode |= 0x10;
+    if (*sensorsVal.temp1 > LIMIT_TEMP_MAX ||
+        *sensorsVal.temp2 > LIMIT_TEMP_MAX ||
+        *sensorsVal.temp3 > LIMIT_TEMP_MAX){
+        errorCode |= ERR_TEMP_OT;
+    }
+
+    // VBAT CHECK
+    if (*sensorsVal.BatteryVoltage < -LIMIT_VBAT_DETECT_MIN){
+        errorCode |= ERR_VBAT_REVERSE;
+    }
+    if (*sensorsVal.BatteryVoltage > LIMIT_VBAT_MAX * LIMIT_MAX_TOLERANCE){
+        errorCode |= ERR_VBAT_OV;
     }
 
     return errorCode;
 }
 
-static void charger_startup(void){
-    if (charger_state != CHARGER_STATE_IDLE &&
-        charger_state != CHARGER_STATE_IDLE_BATT){
-        return;
-    }
-
-    charger_state = CHARGER_STATE_PRECHARGE;
-    psfb_enable = 1;
-}
-
 
 void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
-
-    // LV MCU UART Example with sscanf:
-
-//    static float PFCVoltage;
-//    static float OutputVoltage;
-//    static float OutputCurrent;
-//    static float BatteryVoltage;
-//    static float OutputPower;
-//    static float temp1;
-//    static float temp2;
-//    static float temp3;
-//
-//    if (sscanf((char *)buffer, "VI:%7f, VO:%7f, IO:%7f, VB:%7f, PO:%9f, T1:%7f, T2:%7f, T3:%7f\n",
-//           &PFCVoltage,
-//           &OutputVoltage,
-//           &OutputCurrent,
-//           &BatteryVoltage,
-//           &OutputPower,
-//           &temp1,
-//           &temp2,
-//           &temp3) == 8){
-//        printfDma("// Recieved\n"); // Not recommended to call printfDma in ISR
-//    }
 
     if (len < 2) // Including '/n'
         return;
 
     uint8_t cmd = buffer[0];
     float value = atoff((char *)(buffer+2));
-
-    uart_cmd_recieved = cmd;
 
     switch (cmd)
     {
@@ -447,36 +432,52 @@ void uart_parseRxFrame(uint8_t* buffer, uint32_t len){
         }
         break;
 
-    case CMD_EN_RELAY:
-        if (value > 0){
-            relay_enable = 1;
-        } else {
-            relay_enable = 0;
-        }
+//    case CMD_EN_RELAY:
+//        if (value > 0){
+//            relay_enable = 1;
+//        } else {
+//            relay_enable = 0;
+//        }
+//        break;
+//
+//    case CMD_EN_PSFB:
+//        if (value > 0){
+//            psfb_enable = 1;
+//        } else {
+//            psfb_enable = 0;
+//        }
+//        break;
+
+    case CMD_START_BUTTON:
+        is_startButtonPressed = 1;
         break;
 
-    case CMD_EN_PSFB:
-        if (value > 0){
-            psfb_enable = 1;
-        } else {
-            psfb_enable = 0;
-        }
+    case CMD_DISCHARGE:
+        is_dischargeCommandRx = 1;
         break;
 
-    case CMD_START:
-        if (charger_state == CHARGER_STATE_IDLE ||
-            charger_state == CHARGER_STATE_IDLE_BATT){
-            charger_startup();
+    case CMD_FAULT:
+        if (value > 0){
+            charger_error_lv = value;
         } else {
-            charger_state = CHARGER_STATE_SHUTDOWN;
+            charger_error_lv = 0;
         }
+        // Reset timeout counter
+        charger_error_uartCounter = 0;
         break;
 
     default:
-        uart_cmd_recieved = CMD_INVALID;
+        charger_error_code = CMD_INVALID;
         break;
     }
 
+    if (cmd){
+        if (cmd == CMD_INVALID){
+            printfDma("// UART CMD INVALID\n");
+        } else {
+            printfDma("// UART CMD RECEIVED = [%c][%f]\n", cmd, value);
+        }
+    }
 
     memset(buffer, '\0', len);
 }
@@ -561,7 +562,6 @@ static void CCCV_ramp(void){
     }
 
     // Clamp result for safety
-    // TODO: CALL ERROR
     if (CC_Threshold_Ramp < LIMIT_IOUT_MIN){
         CC_Threshold_Ramp = LIMIT_IOUT_MIN;
     } else if (CC_Threshold_Ramp > LIMIT_IOUT_MAX){
@@ -622,62 +622,120 @@ void HAL_TIM_PeriodElapsedCallback(TIM_HandleTypeDef *htim)
 {
     if (htim->Instance == TIM6)     // 1 kHz
     {
-        timerTest++;
-        CCCV_ramp();
-        CCCV_check();
+        // Handle button press
+        if (is_startButtonPressed){
+            switch (charger_state){
+            case CHARGER_STATE_IDLE:
+            case CHARGER_STATE_IDLE_BATT:
+                charger_state = CHARGER_STATE_PRECHARGE;
+                break;
+            default:
+                charger_state = CHARGER_STATE_IDLE;
+                break;
+            }
+            is_startButtonPressed = 0;
+        }
 
-        charger_errorCode = charger_checkErrors();
+        // Handle discharge command
+        if (is_dischargeCommandRx){
+            switch (charger_state){
+            case CHARGER_STATE_IDLE:
+            case CHARGER_STATE_IDLE_BATT:
+                charger_state = CHARGER_STATE_DISCHARGE;
+                break;
+            default:
+                break;
+            }
+            is_dischargeCommandRx = 0;
+        }
 
+        // Update error code
+        charger_error_code = charger_checkErrors();
+        if (charger_error_code){
+            // Bypass error state if in discharge state
+            if (charger_state != CHARGER_STATE_DISCHARGE){
+                charger_state = CHARGER_STATE_ERROR;
+            }
+        }
+
+        // Update State
         switch (charger_state){
-
         case CHARGER_STATE_IDLE:
+            relay_enable = 0;
+            psfb_enable = 0;
             if (*sensorsVal.BatteryVoltage > LIMIT_VBAT_DETECT_MIN){
                 charger_state = CHARGER_STATE_IDLE_BATT;
             }
             break;
 
         case CHARGER_STATE_IDLE_BATT:
+            relay_enable = 0;
+            psfb_enable = 0;
             if (*sensorsVal.BatteryVoltage < LIMIT_VBAT_DETECT_MIN){
                 charger_state = CHARGER_STATE_IDLE;
             }
             break;
 
         case CHARGER_STATE_PRECHARGE:
+            relay_enable = 0;
+            psfb_enable = 1;
             // Precharge check before relay ON
-            if (*sensorsVal.OutputVoltage > *sensorsVal.BatteryVoltage * 0.90){
+            if (*sensorsVal.OutputVoltage > *sensorsVal.BatteryVoltage * 0.95){
                 relay_enable = 1;
                 charger_state = CHARGER_STATE_ACTIVE;
             }
             break;
 
         case CHARGER_STATE_ACTIVE:
-            if (charger_errorCode){
+            relay_enable = 1;
+            psfb_enable = 1;
+            if (charger_error_code){
                 relay_enable = 0;
                 psfb_enable = 0;
                 charger_state = CHARGER_STATE_ERROR;
 
-                printfDma("// ERROR DETECTED = [%d]\n", charger_errorCode);
+                printfDma("// ERROR DETECTED = [%d]\n", charger_error_code);
             }
             break;
 
         case CHARGER_STATE_ERROR:
-            if (!charger_errorCode){
+            relay_enable = 0;
+            psfb_enable = 0;
+            if (!charger_error_code){
                 charger_state = CHARGER_STATE_IDLE;
             }
             break;
 
-        case CHARGER_STATE_SHUTDOWN:
-            relay_enable = 0;
-            psfb_enable = 0;
-            charger_state = CHARGER_STATE_IDLE;
+        case CHARGER_STATE_DISCHARGE:
+            relay_enable = 1;
+            psfb_enable = 1;
+            CC_Threshold = 1;
+            CV_Threshold = 60;
+            if ((*sensorsVal.PFCVoltage < 20) &&
+                (*sensorsVal.OutputVoltage < 20)){
+                charger_state = CHARGER_STATE_IDLE;
+            }
             break;
 
         default:
             break;
         }
 
+        CCCV_check();
+        CCCV_ramp();
         enablePinsUpdate();
 
+        // Print new state
+        if (charger_state_prev != charger_state){
+            printfDma("// New State = [%s]\n", CHARGER_STATE_STRING[charger_state]);
+            charger_state_prev = charger_state;
+        }
+
+        // Increment uart timout counter
+        if (charger_error_uartCounter++ == 100)
+            charger_error_uartCounter = 100;
+
+        timerTest++;
     }
 }
 

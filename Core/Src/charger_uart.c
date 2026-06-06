@@ -97,6 +97,10 @@ void HAL_UARTEx_RxEventCallback(UART_HandleTypeDef *huart, uint16_t Size){
 
             if (rxframe_tail >= UART_RX_BUF_SZ){
                 rxframe_tail = 0;
+                if (Size == UART_RX_BUF_SZ)
+                {
+                    break;
+                }
             }
         }
     }
